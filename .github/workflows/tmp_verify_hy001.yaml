@@ -1,0 +1,96 @@
+# TEMPORARY, do not merge. Verifies the fix for HY001 "Memory allocation error" from MySQL Connector/ODBC 9.5
+# on concurrent connects, with the stress repro in .github/hy001-repro. Needs no database or AWS resources.
+name: TEMP Verify HY001 fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'tmp/verify-pin-base-driver-env'
+
+permissions:
+  contents: read
+
+env:
+  BUILD_CONFIG: Debug
+  MYSQL_ODBC_LINUX_DEB_SHA256: '8811633c5424aadbd8d461eec1ab2f6754cc627931b9a38be1890ed2a026caf0'
+  # Nothing listens on port 9, so every connect that gets past mysql_init() is refused
+  CONN_STR: 'SERVER=127.0.0.1;PORT=9;UID=repro;PWD=repro;'
+  CYCLES: '2000'
+  THREADS: '8'
+
+jobs:
+  driver-level:
+    name: MySQL ODBC directly (no pin vs pinned ENV)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install MySQL Connector/ODBC 9.5
+        run: |
+          curl --fail -L "https://dev.mysql.com/get/Downloads/Connector-ODBC/9.5/mysql-connector-odbc_9.5.0-1ubuntu24.04_amd64.deb" \
+            --output "$RUNNER_TEMP/mysql-connector_x64.deb"
+          echo "${{ env.MYSQL_ODBC_LINUX_DEB_SHA256 }}  $RUNNER_TEMP/mysql-connector_x64.deb" | sha256sum --check
+          sudo apt-get update
+          sudo apt-get install -y unixodbc-dev g++ "$RUNNER_TEMP/mysql-connector_x64.deb"
+          echo "MYSQL_DRIVER=$(find /usr -name 'libmyodbc9a.so' | head -n1)" >> "$GITHUB_ENV"
+      - name: Build repro
+        run: g++ -std=c++20 -O1 -pthread .github/hy001-repro/hy001_repro.cpp -o hy001_repro -ldl
+      - name: Without pin, expect HY001
+        run: ./hy001_repro "$MYSQL_DRIVER" "$CONN_STR" "$CYCLES" "$THREADS" 0 hy001
+      - name: With a pinned ENV, expect none
+        run: ./hy001_repro "$MYSQL_DRIVER" "$CONN_STR" "$CYCLES" "$THREADS" 1 none
+
+  wrapper-level:
+    name: Wrapper (${{ matrix.wrapper_source }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # main is two commits back: main <- fix <- this temporary commit
+          - wrapper_source: main
+            expect: hy001
+          - wrapper_source: fix
+            expect: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 3
+      - name: Use main's driver sources for the baseline
+        if: ${{ matrix.wrapper_source == 'main' }}
+        run: git checkout HEAD~2 -- driver
+      - name: Show whether the fix is in the build
+        run: |
+          git log --oneline -3
+          if grep -q PinBaseDriver driver/odbcapi_rds_helper.cpp; then echo "Fix present"; else echo "Fix absent"; fi
+      - name: Install dependencies and MySQL Connector/ODBC 9.5
+        run: |
+          curl --fail -L "https://dev.mysql.com/get/Downloads/Connector-ODBC/9.5/mysql-connector-odbc_9.5.0-1ubuntu24.04_amd64.deb" \
+            --output "$RUNNER_TEMP/mysql-connector_x64.deb"
+          echo "${{ env.MYSQL_ODBC_LINUX_DEB_SHA256 }}  $RUNNER_TEMP/mysql-connector_x64.deb" | sha256sum --check
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libcurl4-openssl-dev libssl-dev odbcinst unixodbc-dev uuid-dev zlib1g-dev \
+            "$RUNNER_TEMP/mysql-connector_x64.deb"
+          echo "MYSQL_DRIVER=$(find /usr -name 'libmyodbc9a.so' | head -n1)" >> "$GITHUB_ENV"
+      - name: Resolve AWS SDK version
+        id: aws-sdk-version
+        run: echo "tag=$(grep AWS_SDK_CPP_TAG scripts/compile_aws_sdk_unix.sh | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" >> "$GITHUB_OUTPUT"
+      - name: Retrieve AWS SDK for C++ Cache
+        id: cache-aws-sdk
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: aws_sdk/install
+          key: ${{ runner.os }}-aws-sdk-cpp-${{ env.BUILD_CONFIG }}-shared-${{ steps.aws-sdk-version.outputs.tag }}
+      - name: Build AWS SDK for C++
+        if: ${{ steps.cache-aws-sdk.outputs.cache-hit != 'true' }}
+        run: ./scripts/compile_aws_sdk_unix.sh ${{ env.BUILD_CONFIG }}
+      - name: Build wrapper (ANSI)
+        run: |
+          cmake -S . -B build -DBUILD_UNICODE=OFF -DBUILD_ANSI=ON -DBUILD_UNIT_TEST=OFF -DCMAKE_BUILD_TYPE=${{ env.BUILD_CONFIG }}
+          cmake --build build --parallel
+      - name: Build repro
+        run: g++ -std=c++20 -O1 -pthread .github/hy001-repro/hy001_repro.cpp -o hy001_repro -ldl
+      - name: Run repro through the wrapper, expect ${{ matrix.expect }}
+        run: |
+          ./hy001_repro "$PWD/build/driver/aws-advanced-odbc-wrapper-a.so" "BASE_DRIVER=$MYSQL_DRIVER;$CONN_STR" \
+            "$CYCLES" "$THREADS" 0 ${{ matrix.expect }}
