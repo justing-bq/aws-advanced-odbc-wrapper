@@ -9,7 +9,10 @@
 //
 // Usage: hy001_repro <odbc library> <connection string> <cycles> <threads> <pin 0|1> <expect hy001|none>
 //   pin 1    keeps one extra ENV of the library open for the whole run
-//   expect   hy001: exit 0 only if HY001 was seen (the bug reproduced); none: exit 0 only if it was not
+//   expect   only printed, the workflow judges the outcome
+//
+// Exit codes: 0 no HY001, 1 HY001 seen, SIGABRT a cycle hung (the watchdog aborts for a core dump), other signals
+// a crash
 
 #include <dlfcn.h>
 #include <sql.h>
@@ -60,6 +63,9 @@ int main(int argc, char** argv) {
     const bool pin = std::string(argv[5]) == "1";
     const std::string expect = argv[6];
 
+    // Unbuffered, so the output up to a crash is kept
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+
     void* lib = dlopen(library.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!lib) {
         std::fprintf(stderr, "dlopen %s failed: %s\n", library.c_str(), dlerror());
@@ -90,8 +96,32 @@ int main(int argc, char** argv) {
     std::map<std::string, long> outcomes;
     long cycles_with_hy001 = 0;
 
+    // Aborts if a cycle makes no progress for a minute, so a hang leaves a core dump with every thread's stack
+    std::atomic<int> current_cycle{0};
+    std::atomic<long> last_progress_ms{0};
+    const auto now_ms = [] {
+        return static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    };
+    last_progress_ms = now_ms();
+    std::thread watchdog([&] {
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (now_ms() - last_progress_ms > 60000) {
+                std::printf("HANG: cycle %d made no progress for 60s, aborting\n", current_cycle.load());
+                std::abort();
+            }
+        }
+    });
+    watchdog.detach();
+
     const auto start = std::chrono::steady_clock::now();
     for (int cycle = 0; cycle < cycles; cycle++) {
+        current_cycle = cycle;
+        last_progress_ms = now_ms();
+        if (cycle % 250 == 0) {
+            std::printf("cycle %d, HY001 so far %ld\n", cycle, hy001.load());
+        }
         SQLHENV env = SQL_NULL_HENV;
         if (!SQL_SUCCEEDED(alloc_handle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &env))) {
             std::fprintf(stderr, "Cycle %d: unable to allocate ENV\n", cycle);
@@ -157,18 +187,5 @@ int main(int argc, char** argv) {
     }
     std::printf("RESULT: HY001=%ld in %ld of %d cycles\n", hy001.load(), cycles_with_hy001, cycles);
 
-    if (expect == "hy001") {
-        if (hy001 == 0) {
-            std::printf("FAIL: expected the bug to reproduce, but no HY001 was seen\n");
-            return 1;
-        }
-        std::printf("OK: reproduced\n");
-        return 0;
-    }
-    if (hy001 != 0) {
-        std::printf("FAIL: expected no HY001\n");
-        return 1;
-    }
-    std::printf("OK: no HY001\n");
-    return 0;
+    return hy001 == 0 ? 0 : 1;
 }

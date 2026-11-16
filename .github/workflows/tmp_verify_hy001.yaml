@@ -31,14 +31,21 @@ jobs:
             --output "$RUNNER_TEMP/mysql-connector_x64.deb"
           echo "${{ env.MYSQL_ODBC_LINUX_DEB_SHA256 }}  $RUNNER_TEMP/mysql-connector_x64.deb" | sha256sum --check
           sudo apt-get update
-          sudo apt-get install -y unixodbc-dev g++ "$RUNNER_TEMP/mysql-connector_x64.deb"
+          sudo apt-get install -y gdb g++ unixodbc-dev "$RUNNER_TEMP/mysql-connector_x64.deb"
           echo "MYSQL_DRIVER=$(find /usr -name 'libmyodbc9a.so' | head -n1)" >> "$GITHUB_ENV"
       - name: Build repro
-        run: g++ -std=c++20 -O1 -pthread .github/hy001-repro/hy001_repro.cpp -o hy001_repro -ldl
-      - name: Without pin, expect HY001
-        run: ./hy001_repro "$MYSQL_DRIVER" "$CONN_STR" "$CYCLES" "$THREADS" 0 hy001
-      - name: With a pinned ENV, expect none
-        run: ./hy001_repro "$MYSQL_DRIVER" "$CONN_STR" "$CYCLES" "$THREADS" 1 none
+        run: g++ -std=c++20 -g -O1 -pthread .github/hy001-repro/hy001_repro.cpp -o hy001_repro -ldl
+      - name: Enable core dumps
+        run: |
+          sudo mkdir -p /tmp/cores && sudo chmod 1777 /tmp/cores
+          sudo sysctl -w kernel.core_pattern=/tmp/cores/core.%e.%p
+      - name: Without pin, expect the bug
+        timeout-minutes: 10
+        run: bash .github/hy001-repro/run.sh bug "$MYSQL_DRIVER" "$CONN_STR" "$CYCLES" "$THREADS" 0 bug
+      - name: With a pinned ENV, expect clean
+        if: ${{ always() }}
+        timeout-minutes: 10
+        run: bash .github/hy001-repro/run.sh clean "$MYSQL_DRIVER" "$CONN_STR" "$CYCLES" "$THREADS" 1 clean
 
   wrapper-level:
     name: Wrapper (${{ matrix.wrapper_source }})
@@ -47,21 +54,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # main is two commits back: main <- fix <- this temporary commit
+          # main is three commits back: main <- fix <- the two temporary commits
           - wrapper_source: main
-            expect: hy001
+            expect: bug
           - wrapper_source: fix
-            expect: none
+            expect: clean
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 3
+          fetch-depth: 0
       - name: Use main's driver sources for the baseline
         if: ${{ matrix.wrapper_source == 'main' }}
-        run: git checkout HEAD~2 -- driver
+        run: git checkout 5f49a1ec7321df7c0105467dbc17b93c2564a108 -- driver
       - name: Show whether the fix is in the build
         run: |
-          git log --oneline -3
+          git log --oneline -4
           if grep -q PinBaseDriver driver/odbcapi_rds_helper.cpp; then echo "Fix present"; else echo "Fix absent"; fi
       - name: Install dependencies and MySQL Connector/ODBC 9.5
         run: |
@@ -69,7 +76,7 @@ jobs:
             --output "$RUNNER_TEMP/mysql-connector_x64.deb"
           echo "${{ env.MYSQL_ODBC_LINUX_DEB_SHA256 }}  $RUNNER_TEMP/mysql-connector_x64.deb" | sha256sum --check
           sudo apt-get update
-          sudo apt-get install -y cmake g++ libcurl4-openssl-dev libssl-dev odbcinst unixodbc-dev uuid-dev zlib1g-dev \
+          sudo apt-get install -y cmake gdb g++ libcurl4-openssl-dev libssl-dev odbcinst unixodbc-dev uuid-dev zlib1g-dev \
             "$RUNNER_TEMP/mysql-connector_x64.deb"
           echo "MYSQL_DRIVER=$(find /usr -name 'libmyodbc9a.so' | head -n1)" >> "$GITHUB_ENV"
       - name: Resolve AWS SDK version
@@ -89,8 +96,13 @@ jobs:
           cmake -S . -B build -DBUILD_UNICODE=OFF -DBUILD_ANSI=ON -DBUILD_UNIT_TEST=OFF -DCMAKE_BUILD_TYPE=${{ env.BUILD_CONFIG }}
           cmake --build build --parallel
       - name: Build repro
-        run: g++ -std=c++20 -O1 -pthread .github/hy001-repro/hy001_repro.cpp -o hy001_repro -ldl
-      - name: Run repro through the wrapper, expect ${{ matrix.expect }}
+        run: g++ -std=c++20 -g -O1 -pthread .github/hy001-repro/hy001_repro.cpp -o hy001_repro -ldl
+      - name: Enable core dumps
         run: |
-          ./hy001_repro "$PWD/build/driver/aws-advanced-odbc-wrapper-a.so" "BASE_DRIVER=$MYSQL_DRIVER;$CONN_STR" \
-            "$CYCLES" "$THREADS" 0 ${{ matrix.expect }}
+          sudo mkdir -p /tmp/cores && sudo chmod 1777 /tmp/cores
+          sudo sysctl -w kernel.core_pattern=/tmp/cores/core.%e.%p
+      - name: Run repro through the wrapper, expect ${{ matrix.expect }}
+        timeout-minutes: 10
+        run: |
+          bash .github/hy001-repro/run.sh ${{ matrix.expect }} "$PWD/build/driver/aws-advanced-odbc-wrapper-a.so" \
+            "BASE_DRIVER=$MYSQL_DRIVER;$CONN_STR" "$CYCLES" "$THREADS" 0 ${{ matrix.expect }}
